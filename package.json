@@ -1,0 +1,13 @@
+{
+  "name": "gel-scraper-proxy",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "puppeteer": "^22.12.1"
+  }
+}
