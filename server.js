@@ -1,13 +1,15 @@
 // server.js
 "use strict";
 
+const fs = require("fs");
+const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const puppeteer = require("puppeteer");
 
 const app = express();
 
-/** CORS abierto (ajusta si quieres restringir dominios) */
+/** CORS abierto; ajústalo si quieres restringir dominios */
 app.use(cors({
   origin: (origin, cb) => cb(null, true),
   methods: ["GET", "OPTIONS"],
@@ -24,15 +26,51 @@ app.use((req, res, next) => {
   next();
 });
 
-/** Healthcheck y raíz simple (sin depender de /public) */
+/** Health/minitest */
 app.get("/ping", (_req, res) => res.type("text").send("ok"));
 app.get("/", (_req, res) => {
-  res.type("text").send(
-    "gel-scraper-proxy listo. Usa /api/gel?tracking=TU_NUMERO o /ping"
-  );
+  res.type("text").send("gel-scraper-proxy listo. Usa /api/gel?tracking=TU_NUMERO o /ping");
 });
 
-/** Utilidad: espera hasta que el body contenga algún texto esperado */
+/** Resolver Chrome desde el cache dentro del proyecto */
+const CACHE_DIR = process.env.PUPPETEER_CACHE_DIR
+  ? path.resolve(process.cwd(), process.env.PUPPETEER_CACHE_DIR)
+  : path.join(__dirname, ".cache", "puppeteer");
+
+function resolveChromeExecutable() {
+  // 1) Deja que Puppeteer lo resuelva (si ya ve el cache correcto)
+  try {
+    const p = puppeteer.executablePath();
+    if (p && fs.existsSync(p)) return p;
+  } catch (_) {}
+
+  // 2) Buscar en ./cache local (cualquier versión)
+  try {
+    const chromeBase = path.join(CACHE_DIR, "chrome");
+    const versions = fs.readdirSync(chromeBase, { withFileTypes: true })
+      .filter(d => d.isDirectory())
+      .map(d => d.name)
+      .sort(); // última versión al final
+    for (let i = versions.length - 1; i >= 0; i--) {
+      const v = versions[i];
+      const candidate = path.join(chromeBase, v, "chrome-linux64", "chrome");
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  } catch (_) {}
+
+  return null;
+}
+
+app.get("/chrome-path", (_req, res) => {
+  const execPath = resolveChromeExecutable();
+  res.json({
+    PUPPETEER_CACHE_DIR: CACHE_DIR,
+    resolved: execPath,
+    exists: execPath ? fs.existsSync(execPath) : false
+  });
+});
+
+/** Utilidad: esperar hasta que aparezca algún texto en el body */
 async function waitForAnyText(page, texts = [], timeout = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
@@ -43,16 +81,24 @@ async function waitForAnyText(page, texts = [], timeout = 15000) {
   return false;
 }
 
-/** API principal: /api/gel?tracking=XXXX */
+/** API principal */
 app.get("/api/gel", async (req, res) => {
   const tracking = (req.query.tracking || "").trim();
   if (!tracking) return res.status(400).json({ ok: false, error: "Falta ?tracking=" });
 
   let browser;
   try {
-    // Usamos el Chromium que puppeteer descarga en `npm install`
+    const executablePath = resolveChromeExecutable();
+    if (!executablePath) {
+      return res.status(500).json({
+        ok: false,
+        error: `No se encontró Chrome en ${CACHE_DIR}. Revisa Build Command y PUPPETEER_CACHE_DIR.`
+      });
+    }
+
     browser = await puppeteer.launch({
       headless: true,
+      executablePath,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -93,7 +139,6 @@ app.get("/api/gel", async (req, res) => {
       'form.gv-search input[placeholder*="Rastreo"]',
       'form.gv-search input[type="text"]'
     ].join(",");
-
     const input = await page.$(inputSel);
     if (!input) throw new Error("No encontré el campo de búsqueda.");
 
@@ -106,8 +151,7 @@ app.get("/api/gel", async (req, res) => {
       'form.gv-search button[type="submit"]'
     ].join(",");
     const btn = await page.$(btnSel);
-    if (btn) await btn.click();
-    else await page.keyboard.press("Enter");
+    if (btn) await btn.click(); else await page.keyboard.press("Enter");
 
     // 3) Esperar resultado o mensaje sin resultados
     await waitForAnyText(page, [
@@ -151,7 +195,7 @@ app.get("/api/gel", async (req, res) => {
   }
 });
 
-/** (Opcional) Servir /public si lo agregas más adelante */
+/** (Opcional) servir /public si agregas archivos estáticos */
 app.use(express.static("public"));
 
 /** Inicio del servidor con guard para evitar doble listen */
@@ -161,5 +205,4 @@ if (require.main === module) {
     console.log(`[server] escuchando en puerto ${PORT}`);
   });
 }
-
 module.exports = app;
