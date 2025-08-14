@@ -8,14 +8,12 @@ const puppeteer = require("puppeteer");
 
 const app = express();
 
-/** CORS permisivo (si quieres, luego restringe a tus dominios) */
+/** CORS permisivo (ajústalo a tus dominios si quieres) */
 app.use(cors({
   origin: (origin, cb) => cb(null, true),
   methods: ["GET", "OPTIONS"],
   allowedHeaders: ["Content-Type"]
 }));
-
-// Preflight rápido + compatibilidad con iframes/origen null
 app.use((req, res, next) => {
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
@@ -27,16 +25,16 @@ app.use((req, res, next) => {
   next();
 });
 
-/** Healthchecks y debug simple */
+/** Healthchecks */
 app.get("/ping", (_req, res) => res.type("text").send("ok"));
 app.get("/env", (_req, res) => res.json({ PORT: process.env.PORT }));
 
-/** Página principal (si subes un index.html a /public) */
+/** Página principal (si subes /public/index.html) */
 app.get("/", (_req, res) =>
   res.sendFile(path.join(__dirname, "public", "index.html"))
 );
 
-/** Utilidad: espera hasta que el body contenga algún texto esperado */
+/** Utilidad: espera a que el body contenga alguno de los textos */
 async function waitForAnyText(page, texts = [], timeout = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
@@ -47,19 +45,16 @@ async function waitForAnyText(page, texts = [], timeout = 15000) {
   return false;
 }
 
-/** API principal: /api/gel?tracking=XXXX */
+/** API principal */
 app.get("/api/gel", async (req, res) => {
   const tracking = (req.query.tracking || "").trim();
   if (!tracking) return res.status(400).json({ ok: false, error: "Falta ?tracking=" });
 
   let browser;
   try {
-    // Usa el Chrome instalado en el build por puppeteer
-    const executablePath = puppeteer.executablePath();
-
+    // NO pasamos executablePath: Puppeteer usa su Chromium descargado en npm install
     browser = await puppeteer.launch({
       headless: true,
-      executablePath,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -73,7 +68,7 @@ app.get("/api/gel", async (req, res) => {
     const page = await browser.newPage();
     page.setDefaultTimeout(60000);
 
-    // Bloquea recursos pesados para acelerar
+    // Bloquea imágenes y fuentes para acelerar
     await page.setRequestInterception(true);
     page.on("request", (r) => {
       const t = r.resourceType();
@@ -85,15 +80,13 @@ app.get("/api/gel", async (req, res) => {
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
     );
 
-    // 1) Ir a la página origen
+    // 1) Ir a la página
     await page.goto("https://globalexpresslog.com/paquetes-noidentificados/", {
-      waitUntil: "networkidle2",
-      timeout: 60000
+      waitUntil: "networkidle2", timeout: 60000
     });
 
-    // 2) Formulario e input (GravityView/GravityForms)
+    // 2) Formulario e input (GravityView)
     await page.waitForSelector("form.gv-search", { timeout: 20000 });
-
     const inputSel = [
       'form.gv-search input[type="search"]',
       'form.gv-search input[type="text"][name^="filter_"]',
@@ -101,7 +94,6 @@ app.get("/api/gel", async (req, res) => {
       'form.gv-search input[placeholder*="Rastreo"]',
       'form.gv-search input[type="text"]'
     ].join(",");
-
     const input = await page.$(inputSel);
     if (!input) throw new Error("No encontré el campo de búsqueda.");
 
@@ -113,12 +105,10 @@ app.get("/api/gel", async (req, res) => {
       'form.gv-search input[type="submit"]',
       'form.gv-search button[type="submit"]'
     ].join(",");
-
     const btn = await page.$(btnSel);
-    if (btn) await btn.click();
-    else await page.keyboard.press("Enter");
+    if (btn) await btn.click(); else await page.keyboard.press("Enter");
 
-    // 3) Esperar resultado o mensaje de no encontrado
+    // 3) Esperar resultado o mensaje sin resultados
     await waitForAnyText(page, [
       "Sin Resultado En Búsqueda",
       "FECHA DE INGRESO",
@@ -126,7 +116,7 @@ app.get("/api/gel", async (req, res) => {
       "CB#"
     ], 15000);
 
-    // 4) Extraer datos del texto visible
+    // 4) Extraer datos
     const data = await page.evaluate(() => {
       const text = document.body.innerText || "";
       const noRes = /Sin Resultado En B[uú]squeda/i.test(text);
@@ -160,10 +150,10 @@ app.get("/api/gel", async (req, res) => {
   }
 });
 
-/** Estáticos (sirve /public si lo usas) */
+/** Estáticos (si subes tu skin a /public) */
 app.use(express.static("public"));
 
-/** ---- INICIO DEL SERVIDOR con guard para evitar doble listen ---- */
+/** Inicio del servidor (guard para evitar doble listen) */
 const PORT = Number(process.env.PORT) || 3000;
 if (require.main === module) {
   app.listen(PORT, "0.0.0.0", () => {
