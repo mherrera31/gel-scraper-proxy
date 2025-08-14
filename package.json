@@ -1,6 +1,7 @@
 {
   "name": "gel-scraper-proxy",
   "version": "1.0.0",
+  "description": "Proxy con Puppeteer para consultar globalexpresslog y devolver JSON (SACO/FECHA DE INGRESO)",
   "main": "server.js",
   "type": "commonjs",
   "engines": { "node": ">=20" },
@@ -14,3 +15,4 @@
     "puppeteer": "^22.12.1"
   }
 }
+
