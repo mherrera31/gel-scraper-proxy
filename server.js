@@ -101,7 +101,7 @@ app.get("/api/gel", async (req, res) => {
       console.error("[api] Chrome no encontrado en", CACHE_DIR);
       return res.status(500).json({
         ok: false,
-        error: Chrome no encontrado. Revisa Build Command y PUPPETEER_CACHE_DIR.
+        error: `Chrome no encontrado. Revisa Build Command y PUPPETEER_CACHE_DIR.`
       });
     }
     console.log("[api] usando Chrome:", executablePath);
@@ -244,7 +244,7 @@ app.get("/api/gel", async (req, res) => {
 /* -------------------- Inicio del servidor -------------------- */
 const PORT = Number(process.env.PORT) || 3000;
 if (require.main === module) {
-  app.listen(PORT, "0.0.0.0", () => console.log([server] escuchando en puerto ${PORT}));
+  app.listen(PORT, "0.0.0.0", () => console.log(`[server] escuchando en puerto ${PORT}`));
 }
 module.exports = app;
 
