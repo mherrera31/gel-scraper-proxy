@@ -7,9 +7,11 @@ const express = require("express");
 const cors = require("cors");
 const puppeteer = require("puppeteer");
 
+console.log("[boot] NODE_ENV=%s PORT=%s", process.env.NODE_ENV, process.env.PORT);
+
 const app = express();
 
-/** CORS abierto; ajústalo si quieres restringir dominios */
+/* CORS abierto (ajústalo si quieres restringir) */
 app.use(cors({
   origin: (origin, cb) => cb(null, true),
   methods: ["GET", "OPTIONS"],
@@ -26,41 +28,27 @@ app.use((req, res, next) => {
   next();
 });
 
-/** Health/minitest */
+/* Raíz y healthcheck: NO usa Puppeteer */
+app.get("/", (_req, res) => res.type("text").send("gel-scraper-proxy OK. /ping /chrome-path /chrome-ls /api/gel?tracking=..."));
 app.get("/ping", (_req, res) => res.type("text").send("ok"));
-app.get("/", (_req, res) => {
-  res.type("text").send("gel-scraper-proxy listo. Usa /api/gel?tracking=TU_NUMERO o /ping");
-});
 
-/** Resolver Chrome desde el cache dentro del proyecto */
-const CACHE_DIR = process.env.PUPPETEER_CACHE_DIR
-  ? path.resolve(process.cwd(), process.env.PUPPETEER_CACHE_DIR)
-  : path.join(__dirname, ".cache", "puppeteer");
-
+/* ===== Chrome diagnostics ===== */
+const CACHE_DIR = process.env.PUPPETEER_CACHE_DIR || "/opt/render/project/src/.cache/puppeteer";
 function resolveChromeExecutable() {
-  // 1) Deja que Puppeteer lo resuelva (si ya ve el cache correcto)
   try {
     const p = puppeteer.executablePath();
     if (p && fs.existsSync(p)) return p;
-  } catch (_) {}
-
-  // 2) Buscar en ./cache local (cualquier versión)
+  } catch {}
   try {
     const chromeBase = path.join(CACHE_DIR, "chrome");
-    const versions = fs.readdirSync(chromeBase, { withFileTypes: true })
-      .filter(d => d.isDirectory())
-      .map(d => d.name)
-      .sort(); // última versión al final
-    for (let i = versions.length - 1; i >= 0; i--) {
-      const v = versions[i];
-      const candidate = path.join(chromeBase, v, "chrome-linux64", "chrome");
-      if (fs.existsSync(candidate)) return candidate;
+    const vers = fs.readdirSync(chromeBase, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name).sort();
+    for (let i = vers.length - 1; i >= 0; i--) {
+      const pth = path.join(chromeBase, vers[i], "chrome-linux64", "chrome");
+      if (fs.existsSync(pth)) return pth;
     }
-  } catch (_) {}
-
+  } catch {}
   return null;
 }
-
 app.get("/chrome-path", (_req, res) => {
   const execPath = resolveChromeExecutable();
   res.json({
@@ -69,8 +57,18 @@ app.get("/chrome-path", (_req, res) => {
     exists: execPath ? fs.existsSync(execPath) : false
   });
 });
+app.get("/chrome-ls", (_req, res) => {
+  const out = { cacheDir: CACHE_DIR, entries: [] };
+  try {
+    const base = path.join(CACHE_DIR, "chrome");
+    out.entries = fs.readdirSync(base);
+  } catch (e) {
+    out.error = String(e.message || e);
+  }
+  res.json(out);
+});
 
-/** Utilidad: esperar hasta que aparezca algún texto en el body */
+/* Utilidad: esperar hasta ver ciertos textos en la página */
 async function waitForAnyText(page, texts = [], timeout = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
@@ -81,7 +79,7 @@ async function waitForAnyText(page, texts = [], timeout = 15000) {
   return false;
 }
 
-/** API principal */
+/* ===== API ===== */
 app.get("/api/gel", async (req, res) => {
   const tracking = (req.query.tracking || "").trim();
   if (!tracking) return res.status(400).json({ ok: false, error: "Falta ?tracking=" });
@@ -90,11 +88,13 @@ app.get("/api/gel", async (req, res) => {
   try {
     const executablePath = resolveChromeExecutable();
     if (!executablePath) {
+      console.error("[api] Chrome no encontrado en", CACHE_DIR);
       return res.status(500).json({
         ok: false,
-        error: `No se encontró Chrome en ${CACHE_DIR}. Revisa Build Command y PUPPETEER_CACHE_DIR.`
+        error: `Chrome no encontrado. Revisa Build Command y PUPPETEER_CACHE_DIR.`
       });
     }
+    console.log("[api] usando Chrome:", executablePath);
 
     browser = await puppeteer.launch({
       headless: true,
@@ -112,7 +112,7 @@ app.get("/api/gel", async (req, res) => {
     const page = await browser.newPage();
     page.setDefaultTimeout(60000);
 
-    // Bloquear imágenes/fuentes para acelerar
+    // bloquear recursos pesados
     await page.setRequestInterception(true);
     page.on("request", (r) => {
       const t = r.resourceType();
@@ -120,17 +120,14 @@ app.get("/api/gel", async (req, res) => {
       r.continue();
     });
 
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
-    );
+    await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36");
 
-    // 1) Ir a la página
+    // 1) ir a la web
     await page.goto("https://globalexpresslog.com/paquetes-noidentificados/", {
-      waitUntil: "networkidle2",
-      timeout: 60000
+      waitUntil: "networkidle2", timeout: 60000
     });
 
-    // 2) Formulario e input (GravityView/GravityForms)
+    // 2) formulario + input
     await page.waitForSelector("form.gv-search", { timeout: 20000 });
     const inputSel = [
       'form.gv-search input[type="search"]',
@@ -153,7 +150,6 @@ app.get("/api/gel", async (req, res) => {
     const btn = await page.$(btnSel);
     if (btn) await btn.click(); else await page.keyboard.press("Enter");
 
-    // 3) Esperar resultado o mensaje sin resultados
     await waitForAnyText(page, [
       "Sin Resultado En Búsqueda",
       "FECHA DE INGRESO",
@@ -161,17 +157,14 @@ app.get("/api/gel", async (req, res) => {
       "CB#"
     ], 15000);
 
-    // 4) Extraer datos visibles
     const data = await page.evaluate(() => {
       const text = document.body.innerText || "";
       const noRes = /Sin Resultado En B[uú]squeda/i.test(text);
-
       const getAfter = (label) => {
         const re = new RegExp(label + "\\s+([^\\n\\r]+)", "i");
         const m = text.match(re);
         return m ? m[1].trim() : null;
       };
-
       const saco = getAfter("SACO") || getAfter("CB") || getAfter("CB#");
       let fecha = getAfter("FECHA DE INGRESO");
       if (!fecha) {
@@ -195,14 +188,13 @@ app.get("/api/gel", async (req, res) => {
   }
 });
 
-/** (Opcional) servir /public si agregas archivos estáticos */
-app.use(express.static("public"));
-
-/** Inicio del servidor con guard para evitar doble listen */
+/* Arrancar servidor */
 const PORT = Number(process.env.PORT) || 3000;
 if (require.main === module) {
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[server] escuchando en puerto ${PORT}`);
-  });
+  app.listen(PORT, "0.0.0.0", () => console.log(`[server] escuchando en puerto ${PORT}`));
 }
 module.exports = app;
+
+/* Log de errores globales para verlos en Render Logs */
+process.on("unhandledRejection", (r) => console.error("[unhandledRejection]", r));
+process.on("uncaughtException",  (e) => console.error("[uncaughtException]", e));
