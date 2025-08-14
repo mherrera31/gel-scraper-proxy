@@ -38,10 +38,12 @@ app.get("/ping", (_req, res) => res.type("text").send("ok"));
 const CACHE_DIR = process.env.PUPPETEER_CACHE_DIR || "/opt/render/project/src/.cache/puppeteer";
 
 function resolveChromeExecutable() {
+  // 1) Deja que Puppeteer resuelva si ya conoce el binario
   try {
     const p = puppeteer.executablePath();
     if (p && fs.existsSync(p)) return p;
   } catch {}
+  // 2) Busca en el cache local
   try {
     const chromeBase = path.join(CACHE_DIR, "chrome");
     const vers = fs.readdirSync(chromeBase, { withFileTypes: true })
@@ -76,77 +78,37 @@ app.get("/chrome-ls", (_req, res) => {
   res.json(out);
 });
 
-/* -------------------- Scraper helpers -------------------- */
-async function getVisibleInputHandle(page, candidates, timeout = 30000) {
-  await page.waitForFunction((sel) => {
-    const list = Array.from(document.querySelectorAll(sel));
-    return list.some(el => {
-      const cs = getComputedStyle(el);
-      const r = el.getBoundingClientRect();
-      return el.offsetParent !== null && cs.visibility !== "hidden" && r.width > 0 && r.height > 0;
-    });
-  }, { timeout }, candidates);
-
-  const handle = await page.evaluateHandle((sel) => {
-    const list = Array.from(document.querySelectorAll(sel));
-    return list.find(el => {
-      const cs = getComputedStyle(el);
-      const r = el.getBoundingClientRect();
-      return el.offsetParent !== null && cs.visibility !== "hidden" && r.width > 0 && r.height > 0;
-    }) || null;
-  }, candidates);
-
-  return handle && handle.asElement();
+/* -------------------- Utilidad espera texto -------------------- */
+async function waitForAnyText(page, texts = [], timeout = 15000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const body = await page.evaluate(() => document.body.innerText || "");
+    if (texts.some(t => new RegExp(t, "i").test(body))) return true;
+    await page.waitForTimeout(300);
+  }
+  return false;
 }
 
-function extractCbAndFechaFromText(rawText) {
-  const text = (rawText || "").replace(/\u00A0/g, " "); // NBSP -> espacio
-  const fechaRe = /(\d{1,2}\/\d{1,2}\/\d{4})/;
+/* -------------------- API principal -------------------- */
+app.get("/api/gel", async (req, res) => {
+  const tracking = (req.query.tracking || "").trim();
+  if (!tracking) return res.status(400).json({ ok: false, error: "Falta ?tracking=" });
 
-  const sliceWindow = (label, len = 150) => {
-    const idx = text.indexOf(label);
-    if (idx === -1) return "";
-    return text.slice(idx, idx + len);
-  };
-
-  // ---- CB / SACO normalizado ----
-  let cb = null;
-  let win = sliceWindow("SACO");
-  let m = win.match(/(CB\s*#?\s*\d+|SACO\s*#?\s*\d+)/i);
-  if (m) {
-    cb = m[1].replace(/\s+/g, "")
-             .replace(/CB#?/i, "CB#")
-             .replace(/SACO#?/i, "SACO#");
-  }
-  if (!cb) {
-    // ventana cerca de "CB" o global
-    m = sliceWindow("CB").match(/CB\s*#?\s*\d+/i) || text.match(/CB\s*#?\s*\d+/i);
-    if (m) cb = m[0].replace(/\s+/g, "").replace(/CB#?/i, "CB#");
-  }
-
-  // ---- FECHA ----
-  let fecha = null;
-  win = sliceWindow("FECHA DE INGRESO", 120);
-  m = win.match(fechaRe);
-  if (m) fecha = m[1];
-  if (!fecha) {
-    m = text.match(fechaRe);
-    if (m) fecha = m[1];
-  }
-
-  // Señal de "sin resultado" real: aparece el texto y no vemos fecha ni CB
-  const noResBanner = /Sin Resultado En B[uú]squeda/i.test(text);
-  const found = Boolean((cb || fecha) && !noResBanner);
-
-  return { cb, fecha, found };
-}
-
-async function scrapeGel(tracking, execPath) {
   let browser;
   try {
+    const executablePath = resolveChromeExecutable();
+    if (!executablePath) {
+      console.error("[api] Chrome no encontrado en", CACHE_DIR);
+      return res.status(500).json({
+        ok: false,
+        error: Chrome no encontrado. Revisa Build Command y PUPPETEER_CACHE_DIR.
+      });
+    }
+    console.log("[api] usando Chrome:", executablePath);
+
     browser = await puppeteer.launch({
       headless: true,
-      executablePath: execPath,
+      executablePath,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -154,14 +116,14 @@ async function scrapeGel(tracking, execPath) {
         "--disable-gpu",
         "--no-first-run",
         "--no-zygote",
-        "--single-process" // RAM friendly
+        "--single-process" // ayuda en instancias con poca RAM
       ]
     });
 
     const page = await browser.newPage();
     page.setDefaultTimeout(60000);
 
-    // Acelerar: bloquear imágenes/fuentes
+    // Bloquear recursos pesados para acelerar
     await page.setRequestInterception(true);
     page.on("request", (r) => {
       const t = r.resourceType();
@@ -172,13 +134,13 @@ async function scrapeGel(tracking, execPath) {
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36");
     await page.setExtraHTTPHeaders({ "accept-language": "es-ES,es;q=0.9,en;q=0.8" });
 
-    // 1) Ir a la página (rápido) y luego esperar elementos
+    // 1) Ir a la página (rápido) y luego esperamos elementos
     await page.goto("https://globalexpresslog.com/paquetes-noidentificados/", {
       waitUntil: "domcontentloaded",
       timeout: 60000
     });
 
-    // 2) Ocultar overlays/preloaders/cookies
+    // 2) Ocultar overlays/preloaders/cookies si existen
     await page.evaluate(() => {
       const hide = (sel) => document.querySelectorAll(sel).forEach(el => (el.style.display = "none"));
       hide(".mk-body-loader-overlay, .page-preloader");
@@ -186,8 +148,8 @@ async function scrapeGel(tracking, execPath) {
       hide(".cky-consent-container, .cookie-notice, .cn-wrapper");
     });
 
-    // 3) Input visible (sin depender de form.gv-search)
-    const INPUTS = [
+    // 3) Esperar un input VISIBLE válido (hasta 30s)
+    const INPUT_CANDIDATES = [
       'input[placeholder*="Tracking" i]',
       'input[placeholder*="Rastreo" i]',
       'input[type="search"]',
@@ -195,13 +157,32 @@ async function scrapeGel(tracking, execPath) {
       'input[type="text"]'
     ].join(",");
 
-    const input = await getVisibleInputHandle(page, INPUTS, 30000);
-    if (!input) throw new Error("No encontré un input visible para escribir el tracking.");
+    await page.waitForFunction((sel) => {
+      const list = Array.from(document.querySelectorAll(sel));
+      return list.some(el => {
+        const cs = getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return el.offsetParent !== null && cs.visibility !== "hidden" && r.width > 0 && r.height > 0;
+      });
+    }, { timeout: 30000 }, INPUT_CANDIDATES);
 
+    // 4) Obtener handle del primer input visible
+    const inputHandle = await page.evaluateHandle((sel) => {
+      const list = Array.from(document.querySelectorAll(sel));
+      return list.find(el => {
+        const cs = getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return el.offsetParent !== null && cs.visibility !== "hidden" && r.width > 0 && r.height > 0;
+      }) || null;
+    }, INPUT_CANDIDATES);
+
+    if (!inputHandle) throw new Error("No encontré un input visible para escribir el tracking.");
+
+    const input = inputHandle.asElement();
     await input.click({ clickCount: 3 });
     await input.type(tracking, { delay: 25 });
 
-    // 4) Click en SEARCH/Buscar o submit/Enter
+    // 5) Click en SEARCH/Buscar o submit/Enter
     const clicked = await page.evaluate(() => {
       const btns = Array.from(document.querySelectorAll("button, input[type='submit'], a"));
       const byText = btns.find(b => /^(search|buscar)$/i.test((b.textContent || b.value || "").trim()));
@@ -212,60 +193,58 @@ async function scrapeGel(tracking, execPath) {
     });
     if (!clicked) await page.keyboard.press("Enter");
 
-    // 5) Esperar texto de resultados
-    await page.waitForTimeout(1500);
-    const ok = await page.waitForFunction(() => {
+    // 6) Esperar a que aparezcan resultados o "sin resultado" (hasta 25s)
+    const appeared = await page.waitForFunction(() => {
       const t = document.body.innerText || "";
       return /Sin Resultado En B[uú]squeda/i.test(t) ||
              /FECHA DE INGRESO/i.test(t) ||
              /SACO/i.test(t) || /CB#/i.test(t);
     }, { timeout: 25000 }).catch(() => false);
 
-    const bodyText = await page.evaluate(() => document.body.innerText || "");
-    const { cb, fecha, found } = extractCbAndFechaFromText(bodyText);
+    if (!appeared) {
+      const snip = await page.evaluate(() => (document.body.innerText || "").slice(0, 1200));
+      throw new Error("No aparecieron resultados a tiempo. Snippet: " + snip);
+    }
 
-    return { ok: Boolean(ok), found, cb, fecha, _debugBody: bodyText.slice(0, 1500) };
-  } finally {
-    try { if (browser) await browser.close(); } catch {}
-  }
-}
+    // 7) Extraer datos del texto visible
+    const data = await page.evaluate(() => {
+      const text = document.body.innerText || "";
+      const noRes = /Sin Resultado En B[uú]squeda/i.test(text);
 
-/* -------------------- API: SOLO cb y fecha -------------------- */
-app.get("/api/gel", async (req, res) => {
-  const tracking = (req.query.tracking || "").trim();
-  const debug = String(req.query.debug || "0") === "1";
-  if (!tracking) return res.status(400).json({ ok: false, error: "Falta ?tracking=" });
+      const getAfter = (label) => {
+        const re = new RegExp(label + "\\s+([^\\n\\r]+)", "i");
+        const m = text.match(re);
+        return m ? m[1].trim() : null;
+      };
 
-  const execPath = resolveChromeExecutable();
-  if (!execPath) {
-    console.error("[api] Chrome no encontrado en", CACHE_DIR);
-    return res.status(500).json({
-      ok: false,
-      error: `Chrome no encontrado. Revisa Build Command y PUPPETEER_CACHE_DIR.`
+      const saco = getAfter("SACO") || getAfter("CB") || getAfter("CB#");
+      let fecha = getAfter("FECHA DE INGRESO");
+      if (!fecha) {
+        const m = text.match(/FECHA[^\n\r]*?(\d{1,2}\/\d{1,2}\/\d{4})/i);
+        if (m) fecha = m[1];
+      }
+      return { noRes, saco, fecha };
     });
-  }
-  console.log("[api] usando Chrome:", execPath);
 
-  try {
-    const result = await scrapeGel(tracking, execPath);
-    const payload = {
+    res.json({
       ok: true,
-      found: result.found,
-      cb: result.cb || null,
-      fecha: result.fecha || null
-    };
-    if (debug) payload._debugBody = result._debugBody;
-    res.json(payload);
+      found: !data.noRes && (data.saco || data.fecha),
+      saco: data.saco || null,
+      fecha_de_ingreso: data.fecha || null
+    });
+
   } catch (e) {
     console.error("[/api/gel] Error:", e);
     res.status(500).json({ ok: false, error: String(e.message || e) });
+  } finally {
+    try { if (browser) await browser.close(); } catch {}
   }
 });
 
 /* -------------------- Inicio del servidor -------------------- */
 const PORT = Number(process.env.PORT) || 3000;
 if (require.main === module) {
-  app.listen(PORT, "0.0.0.0", () => console.log(`[server] escuchando en puerto ${PORT}`));
+  app.listen(PORT, "0.0.0.0", () => console.log([server] escuchando en puerto ${PORT}));
 }
 module.exports = app;
 
