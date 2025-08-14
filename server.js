@@ -1,23 +1,21 @@
 // server.js
 "use strict";
 
+const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const puppeteer = require("puppeteer");
 
 const app = express();
 
-/**
- * CORS permisivo para que funcione desde cualquier dominio.
- * Si quieres restringir, cambia origin: true por una función que valide el dominio.
- */
+/** CORS permisivo (si quieres, luego restringe a tus dominios) */
 app.use(cors({
   origin: (origin, cb) => cb(null, true),
   methods: ["GET", "OPTIONS"],
   allowedHeaders: ["Content-Type"]
 }));
 
-// Preflight rápido
+// Preflight rápido + compatibilidad con iframes/origen null
 app.use((req, res, next) => {
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
@@ -29,13 +27,16 @@ app.use((req, res, next) => {
   next();
 });
 
-// Healthchecks
-app.get("/", (req, res) => res.sendFile(require("path").join(__dirname, "public", "index.html")));
-app.get("/ping", (req, res) => res.type("text").send("ok"));
+/** Healthchecks y debug simple */
+app.get("/ping", (_req, res) => res.type("text").send("ok"));
+app.get("/env", (_req, res) => res.json({ PORT: process.env.PORT }));
 
-/**
- * Utilidad: espera a que el body contenga cualquiera de los textos esperados.
- */
+/** Página principal (si subes un index.html a /public) */
+app.get("/", (_req, res) =>
+  res.sendFile(path.join(__dirname, "public", "index.html"))
+);
+
+/** Utilidad: espera hasta que el body contenga algún texto esperado */
 async function waitForAnyText(page, texts = [], timeout = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
@@ -46,16 +47,14 @@ async function waitForAnyText(page, texts = [], timeout = 15000) {
   return false;
 }
 
-/**
- * Scraping principal
- */
+/** API principal: /api/gel?tracking=XXXX */
 app.get("/api/gel", async (req, res) => {
   const tracking = (req.query.tracking || "").trim();
   if (!tracking) return res.status(400).json({ ok: false, error: "Falta ?tracking=" });
 
   let browser;
   try {
-    // Usa el Chrome que instala Puppeteer (con Build Command: `npm install && npx puppeteer browsers install chrome`)
+    // Usa el Chrome instalado en el build por puppeteer
     const executablePath = puppeteer.executablePath();
 
     browser = await puppeteer.launch({
@@ -74,25 +73,25 @@ app.get("/api/gel", async (req, res) => {
     const page = await browser.newPage();
     page.setDefaultTimeout(60000);
 
-    // Acelera: bloquea imágenes y fonts
+    // Bloquea recursos pesados para acelerar
     await page.setRequestInterception(true);
-    page.on("request", (reqq) => {
-      const type = reqq.resourceType();
-      if (type === "image" || type === "font" || type === "media") return reqq.abort();
-      reqq.continue();
+    page.on("request", (r) => {
+      const t = r.resourceType();
+      if (t === "image" || t === "font" || t === "media") return r.abort();
+      r.continue();
     });
 
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
     );
 
-    // 1) Abre la página
+    // 1) Ir a la página origen
     await page.goto("https://globalexpresslog.com/paquetes-noidentificados/", {
       waitUntil: "networkidle2",
       timeout: 60000
     });
 
-    // 2) Ubica formulario e input (GravityView / GravityForms)
+    // 2) Formulario e input (GravityView/GravityForms)
     await page.waitForSelector("form.gv-search", { timeout: 20000 });
 
     const inputSel = [
@@ -119,7 +118,7 @@ app.get("/api/gel", async (req, res) => {
     if (btn) await btn.click();
     else await page.keyboard.press("Enter");
 
-    // 3) Espera que aparezcan resultados o el mensaje de "Sin Resultado..."
+    // 3) Esperar resultado o mensaje de no encontrado
     await waitForAnyText(page, [
       "Sin Resultado En Búsqueda",
       "FECHA DE INGRESO",
@@ -127,10 +126,9 @@ app.get("/api/gel", async (req, res) => {
       "CB#"
     ], 15000);
 
-    // 4) Extrae datos del texto de la página
+    // 4) Extraer datos del texto visible
     const data = await page.evaluate(() => {
       const text = document.body.innerText || "";
-
       const noRes = /Sin Resultado En B[uú]squeda/i.test(text);
 
       const getAfter = (label) => {
@@ -139,15 +137,12 @@ app.get("/api/gel", async (req, res) => {
         return m ? m[1].trim() : null;
       };
 
-      // Muchos casos muestran “SACO” y “FECHA DE INGRESO”
       const saco = getAfter("SACO") || getAfter("CB") || getAfter("CB#");
       let fecha = getAfter("FECHA DE INGRESO");
-
       if (!fecha) {
         const m = text.match(/FECHA[^\n\r]*?(\d{1,2}\/\d{1,2}\/\d{4})/i);
         if (m) fecha = m[1];
       }
-
       return { noRes, saco, fecha };
     });
 
@@ -165,11 +160,14 @@ app.get("/api/gel", async (req, res) => {
   }
 });
 
-// Sirve estáticos (tu HTML "skin" en /public)
+/** Estáticos (sirve /public si lo usas) */
 app.use(express.static("public"));
 
-// Arranca servidor
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Servidor listo en puerto " + PORT));
-
-app.listen(PORT, () => console.log("Escuchando en puerto " + PORT));
+/** ---- INICIO DEL SERVIDOR con guard para evitar doble listen ---- */
+const PORT = Number(process.env.PORT) || 3000;
+if (require.main === module) {
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`[server] escuchando en puerto ${PORT}`);
+  });
+}
+module.exports = app;
