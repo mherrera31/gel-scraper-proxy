@@ -38,12 +38,10 @@ app.get("/ping", (_req, res) => res.type("text").send("ok"));
 const CACHE_DIR = process.env.PUPPETEER_CACHE_DIR || "/opt/render/project/src/.cache/puppeteer";
 
 function resolveChromeExecutable() {
-  // 1) Deja que Puppeteer resuelva si ya conoce el binario
   try {
     const p = puppeteer.executablePath();
     if (p && fs.existsSync(p)) return p;
   } catch {}
-  // 2) Busca en el cache local
   try {
     const chromeBase = path.join(CACHE_DIR, "chrome");
     const vers = fs.readdirSync(chromeBase, { withFileTypes: true })
@@ -116,14 +114,14 @@ app.get("/api/gel", async (req, res) => {
         "--disable-gpu",
         "--no-first-run",
         "--no-zygote",
-        "--single-process" // ayuda en instancias con poca RAM
+        "--single-process"
       ]
     });
 
     const page = await browser.newPage();
     page.setDefaultTimeout(60000);
 
-    // Bloquear recursos pesados para acelerar
+    // bloquear recursos pesados
     await page.setRequestInterception(true);
     page.on("request", (r) => {
       const t = r.resourceType();
@@ -132,103 +130,93 @@ app.get("/api/gel", async (req, res) => {
     });
 
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36");
-    await page.setExtraHTTPHeaders({ "accept-language": "es-ES,es;q=0.9,en;q=0.8" });
 
-    // 1) Ir a la página (rápido) y luego esperamos elementos
+    // 1) ir a la web
     await page.goto("https://globalexpresslog.com/paquetes-noidentificados/", {
-      waitUntil: "domcontentloaded",
-      timeout: 60000
+      waitUntil: "networkidle2", timeout: 60000
     });
 
-    // 2) Ocultar overlays/preloaders/cookies si existen
-    await page.evaluate(() => {
-      const hide = (sel) => document.querySelectorAll(sel).forEach(el => (el.style.display = "none"));
-      hide(".mk-body-loader-overlay, .page-preloader");
-      hide("#omnisend-dynamic-container");
-      hide(".cky-consent-container, .cookie-notice, .cn-wrapper");
-    });
-
-    // 3) Esperar un input VISIBLE válido (hasta 30s)
-    const INPUT_CANDIDATES = [
-      'input[placeholder*="Tracking" i]',
-      'input[placeholder*="Rastreo" i]',
-      'input[type="search"]',
-      'input[name^="filter_"]',
-      'input[type="text"]'
+    // 2) formulario + input
+    await page.waitForSelector("form.gv-search", { timeout: 20000 });
+    const inputSel = [
+      'form.gv-search input[type="search"]',
+      'form.gv-search input[type="text"][name^="filter_"]',
+      'form.gv-search input[placeholder*="Tracking"]',
+      'form.gv-search input[placeholder*="Rastreo"]',
+      'form.gv-search input[type="text"]'
     ].join(",");
+    const input = await page.$(inputSel);
+    if (!input) throw new Error("No encontré el campo de búsqueda.");
 
-    await page.waitForFunction((sel) => {
-      const list = Array.from(document.querySelectorAll(sel));
-      return list.some(el => {
-        const cs = getComputedStyle(el);
-        const r = el.getBoundingClientRect();
-        return el.offsetParent !== null && cs.visibility !== "hidden" && r.width > 0 && r.height > 0;
-      });
-    }, { timeout: 30000 }, INPUT_CANDIDATES);
-
-    // 4) Obtener handle del primer input visible
-    const inputHandle = await page.evaluateHandle((sel) => {
-      const list = Array.from(document.querySelectorAll(sel));
-      return list.find(el => {
-        const cs = getComputedStyle(el);
-        const r = el.getBoundingClientRect();
-        return el.offsetParent !== null && cs.visibility !== "hidden" && r.width > 0 && r.height > 0;
-      }) || null;
-    }, INPUT_CANDIDATES);
-
-    if (!inputHandle) throw new Error("No encontré un input visible para escribir el tracking.");
-
-    const input = inputHandle.asElement();
     await input.click({ clickCount: 3 });
     await input.type(tracking, { delay: 25 });
 
-    // 5) Click en SEARCH/Buscar o submit/Enter
-    const clicked = await page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll("button, input[type='submit'], a"));
-      const byText = btns.find(b => /^(search|buscar)$/i.test((b.textContent || b.value || "").trim()));
-      if (byText) { byText.click(); return true; }
-      const form = (document.activeElement && document.activeElement.form) || document.querySelector("form");
-      if (form && typeof form.requestSubmit === "function") { form.requestSubmit(); return true; }
-      return false;
-    });
-    if (!clicked) await page.keyboard.press("Enter");
+    const btnSel = [
+      'form.gv-search input.gv-search-button',
+      'form.gv-search input[type="submit"]',
+      'form.gv-search button[type="submit"]'
+    ].join(",");
+    const btn = await page.$(btnSel);
+    if (btn) await btn.click(); else await page.keyboard.press("Enter");
 
-    // 6) Esperar a que aparezcan resultados o "sin resultado" (hasta 25s)
-    const appeared = await page.waitForFunction(() => {
-      const t = document.body.innerText || "";
-      return /Sin Resultado En B[uú]squeda/i.test(t) ||
-             /FECHA DE INGRESO/i.test(t) ||
-             /SACO/i.test(t) || /CB#/i.test(t);
-    }, { timeout: 25000 }).catch(() => false);
+    // ⬆️ da tiempo extra a que aparezcan resultados (de 15s -> 25s)
+    await waitForAnyText(page, [
+      "Sin Resultado En Búsqueda",
+      "FECHA DE INGRESO",
+      "SACO",
+      "CB#"
+    ], 25000);
 
-    if (!appeared) {
-      const snip = await page.evaluate(() => (document.body.innerText || "").slice(0, 1200));
-      throw new Error("No aparecieron resultados a tiempo. Snippet: " + snip);
-    }
-
-    // 7) Extraer datos del texto visible
+    // 3) EXTRAER con ventanas cercanas a la etiqueta
     const data = await page.evaluate(() => {
-      const text = document.body.innerText || "";
-      const noRes = /Sin Resultado En B[uú]squeda/i.test(text);
+      const raw = document.body.innerText || "";
+      const text = raw.replace(/\u00A0/g, " "); // NBSP -> espacio
+      const fechaRe = /(\d{1,2}\/\d{1,2}\/\d{4})/;
 
-      const getAfter = (label) => {
-        const re = new RegExp(label + "\\s+([^\\n\\r]+)", "i");
-        const m = text.match(re);
-        return m ? m[1].trim() : null;
+      const hasDate = fechaRe.test(text);
+      const hasCB   = /CB\s*#?\s*\d+/i.test(text);
+
+      // "Sin Resultado..." solo si NO vemos fecha ni CB
+      const noRes = /Sin Resultado En B[uú]squeda/i.test(text) && !(hasDate || hasCB);
+
+      const sliceWindow = (label, len = 150) => {
+        const idx = text.indexOf(label);
+        if (idx === -1) return "";
+        return text.slice(idx, idx + len);
       };
 
-      const saco = getAfter("SACO") || getAfter("CB") || getAfter("CB#");
-      let fecha = getAfter("FECHA DE INGRESO");
+      // ---- SACO / CB ----
+      let saco = null;
+      // primero cerca de "SACO"
+      let win = sliceWindow("SACO");
+      let m = win.match(/(CB\s*#?\s*\d+|SACO\s*#?\s*\d+)/i);
+      if (m) {
+        saco = m[1].replace(/\s+/g, "")
+                    .replace(/CB#?/i, "CB#")
+                    .replace(/SACO#?/i, "SACO#");
+      }
+      // fallback: cerca de "CB" o global
+      if (!saco) {
+        m = sliceWindow("CB").match(/CB\s*#?\s*\d+/i) || text.match(/CB\s*#?\s*\d+/i);
+        if (m) saco = m[0].replace(/\s+/g, "").replace(/CB#?/i, "CB#");
+      }
+
+      // ---- FECHA ----
+      let fecha = null;
+      win = sliceWindow("FECHA DE INGRESO", 120);
+      m = win.match(fechaRe);
+      if (m) fecha = m[1];
       if (!fecha) {
-        const m = text.match(/FECHA[^\n\r]*?(\d{1,2}\/\d{1,2}\/\d{4})/i);
+        m = text.match(fechaRe);
         if (m) fecha = m[1];
       }
+
       return { noRes, saco, fecha };
     });
 
     res.json({
       ok: true,
-      found: !data.noRes && (data.saco || data.fecha),
+      found: Boolean((data.saco || data.fecha) && !data.noRes),
       saco: data.saco || null,
       fecha_de_ingreso: data.fecha || null
     });
