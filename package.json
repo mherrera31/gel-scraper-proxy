@@ -4,7 +4,10 @@
   "main": "server.js",
   "type": "commonjs",
   "engines": { "node": ">=20" },
-  "scripts": { "start": "node server.js" },
+  "scripts": {
+    "start": "node server.js",
+    "postinstall": "npx puppeteer browsers install chrome"
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
